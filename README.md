@@ -1,4 +1,6 @@
-# Street Gaussians: Modeling Dynamic Urban Scenes with Gaussian Splatting
+# FORKED FROM ORIGINAL AUTHORS, MODIFING FOR RESEARCH PURPOSES
+
+## Street Gaussians: Modeling Dynamic Urban Scenes with Gaussian Splatting
 
 ### [Project Page](https://zju3dv.github.io/street_gaussians) | [Paper](https://arxiv.org/pdf/2401.01339.pdf) | [Unofficial Implementation](https://github.com/LightwheelAI/street-gaussians-ns)
 
