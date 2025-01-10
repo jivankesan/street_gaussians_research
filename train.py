@@ -15,11 +15,14 @@ from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
 from lib.utils.system_utils import searchForMaxIteration
 import time
+import csv
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+    
+
 
 def training():
     training_args = cfg.train
@@ -61,8 +64,25 @@ def training():
     start_iter += 1
 
     viewpoint_stack = None
-    for iteration in range(start_iter, training_args.iterations + 1):
+    start_time = time.time()
+    end = start_time
+    last_image_log_time = start_time
+    last_psnr_log_time = start_time
     
+    psnr_log_path = os.path.join(cfg.model_path, "psnr_log.csv")
+    with open(psnr_log_path, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Timestamp", "Iteration", "PSNR"])
+    
+    index = 1
+    test_index = 0
+    for iteration in range(start_iter, training_args.iterations + 1):
+        current_time = time.time()
+        if current_time-end > 0.1:
+            index = min(index + 1, len(viewpoint_stack))
+        end = time.time()
+            
+        print(f"TrainIndex: {index}")
         iter_start.record()
         gaussians.update_learning_rate(iteration)
 
@@ -79,8 +99,9 @@ def training():
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
+            print(len(viewpoint_stack))
         
-        viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        viewpoint_cam: Camera = viewpoint_stack[(randint(0, index - 1))]
     
         # ====================================================================
         # Get mask
@@ -229,30 +250,67 @@ def training():
         loss.backward()
         
         iter_end.record()
-                
-        is_save_images = True
-        if is_save_images and (iteration % 1000 == 0):
-            # row0: gt_image, image, depth
-            # row1: acc, image_obj, acc_obj
-            depth_colored, _ = visualize_depth_numpy(depth.detach().cpu().numpy().squeeze(0))
-            depth_colored = depth_colored[..., [2, 1, 0]] / 255.
-            depth_colored = torch.from_numpy(depth_colored).permute(2, 0, 1).float().cuda()
-            row0 = torch.cat([gt_image, image, depth_colored], dim=2)
-            acc = acc.repeat(3, 1, 1)
-            with torch.no_grad():
-                render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians)
-                image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
-            acc_obj = acc_obj.repeat(3, 1, 1)
-            row1 = torch.cat([acc, image_obj, acc_obj], dim=2)
-            image_to_show = torch.cat([row0, row1], dim=1)
-            image_to_show = torch.clamp(image_to_show, 0.0, 1.0)
-            os.makedirs(f"{cfg.model_path}/log_images", exist_ok = True)
-            save_img_torch(image_to_show, f"{cfg.model_path}/log_images/{iteration}.jpg")
-        
+                    
         with torch.no_grad():
+            print(f"TestIndex: {test_index}")
+            # modified so that we evaluate on the test set every 4 iterations.
+            if iteration % 4 == 0:
+                test_cameras = scene.getTestCameras()
+                num_test_cameras = len(test_cameras)
+                num_images_to_save = 5
+                test_index = min(test_index + 1, num_test_cameras)
+                test_camera_indices = torch.linspace(0, num_test_cameras - 1, num_images_to_save).long()
+
+                image_rows = []
+                test_psnr_total = 0.0  # Initialize PSNR total
+                for idx in range(test_index):
+                    test_camera = test_cameras[idx]
+                    
+                    # Render test image
+                    render_pkg_test = gaussians_renderer.render(test_camera, gaussians)
+                    test_image = render_pkg_test["rgb"]
+                    test_acc = render_pkg_test['acc']
+                    test_depth = render_pkg_test['depth']
+                    gt_test_image = torch.clamp(test_camera.original_image.to("cuda"), 0.0, 1.0)
+                    
+                    if idx in test_camera_indices:
+                        # Prepare ground truth and rendered images
+                        depth_colored, _ = visualize_depth_numpy(test_depth.detach().cpu().numpy().squeeze(0))
+                        depth_colored = depth_colored[..., [2, 1, 0]] / 255.
+                        depth_colored = torch.from_numpy(depth_colored).permute(2, 0, 1).float().cuda()
+                        test_acc = test_acc.repeat(3, 1, 1)
+                        # Combine images for a single row
+                        row = torch.cat([gt_test_image, test_image, depth_colored, test_acc], dim=2)
+                        image_rows.append(row)
+                    
+                    # Compute PSNR for this frame
+                    if hasattr(test_camera, 'original_mask'):
+                        test_mask = test_camera.original_mask.cuda().bool()
+                    else:
+                        test_mask = torch.ones_like(gt_test_image[0:1]).bool()
+                    test_psnr_total += psnr(test_image, gt_test_image, mask=test_mask).mean().item()
+                    
+                    
+                # Average PSNR for the selected test frames
+                avg_test_psnr = test_psnr_total / test_index
+
+                if iteration%4==0:
+                    # Combine all rows into a single image
+                    image_to_show = torch.cat(image_rows, dim=1)  # Stack rows vertically
+                    image_to_show = torch.clamp(image_to_show, 0.0, 1.0)
+                    # Save the final image
+                    os.makedirs(f"{cfg.model_path}/log_images", exist_ok=True)
+                    save_img_torch(image_to_show, f"{cfg.model_path}/log_images/{iteration}_test_images.jpg")
+                    last_image_log_time = current_time
+
+                # Log PSNR to CSV
+                with open(psnr_log_path, mode='a', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([time.time() - start_time, iteration, avg_test_psnr])
+                last_psnr_log_time = current_time
+                
             # Log
             tensor_dict = dict()
-
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_psnr_for_log = 0.4 * psnr(image, gt_image, mask).mean().float() + 0.6 * ema_psnr_for_log
@@ -260,6 +318,14 @@ def training():
                 psnr_dict[viewpoint_cam.id] = psnr(image, gt_image, mask).mean().float()
             else:
                 psnr_dict[viewpoint_cam.id] = 0.4 * psnr(image, gt_image, mask).mean().float() + 0.6 * psnr_dict[viewpoint_cam.id]
+            """
+            if current_time - last_psnr_log_time >= 1.0:
+                psnr_value = psnr(image, gt_image, mask).mean().item()
+                with open(psnr_log_path, mode='a', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([time.time()-start_time, iteration, psnr_value])
+                last_psnr_log_time = current_time
+            """
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Exp": f"{cfg.task}-{cfg.exp_name}", 
                                           "Loss": f"{ema_loss_for_log:.{7}f},", 
